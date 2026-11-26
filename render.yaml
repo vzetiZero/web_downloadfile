@@ -30,3 +30,9 @@ services:
         sync: false
       - key: RESTORE_ZIP_URL
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: PUBLIC_URL
+        sync: false

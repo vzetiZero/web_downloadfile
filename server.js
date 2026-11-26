@@ -357,7 +357,7 @@ async function handleForgotPost(req, res) {
 
   if (!result.ok && result.reason === 'not_configured') {
     await auth.saveOtpPreview(email, code);
-    log(`Chưa cấu hình SMTP. Mã OTP đã ghi ra data/last-otp.txt`);
+    log(`Chưa cấu hình gửi thư. Mã OTP đã ghi ra data/last-otp.txt`);
     redirect(res, `/admin/reset?email=${encodeURIComponent(email)}&sent=preview`);
     return;
   }
@@ -365,9 +365,13 @@ async function handleForgotPost(req, res) {
   if (!result.ok) {
     log('Gửi email OTP thất bại:', result.error || result.reason);
     await auth.saveOtpPreview(email, code);
+    const detail = String(result.error || result.reason || '');
+    const smtpBlocked = /ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH/i.test(detail);
     sendHtml(res, 502, views.forgotPage({
       email,
-      error: 'Không gửi được email. Kiểm tra cấu hình SMTP hoặc thử lại sau.',
+      error: smtpBlocked
+        ? 'Máy chủ này chặn cổng SMTP (Render free). Hãy khai báo RESEND_API_KEY trong tab Environment để gửi mã qua HTTPS.'
+        : 'Không gửi được email. Kiểm tra cấu hình gửi thư hoặc thử lại sau.',
     }));
     return;
   }
