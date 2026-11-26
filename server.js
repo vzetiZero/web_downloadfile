@@ -13,11 +13,12 @@ const path = require('path');
 const crypto = require('crypto');
 
 const { detectCountry, acceptLanguage, clientIp } = require('./lib/geo');
-const { normalizeLang, langForCountry } = require('./lib/i18n');
+const { normalizeLang, langForCountry, t } = require('./lib/i18n');
 const { renderHome } = require('./lib/pages');
 const auth = require('./lib/auth');
 const mailer = require('./lib/mailer');
 const store = require('./lib/store');
+const settings = require('./lib/settings');
 const restore = require('./lib/restore');
 const views = require('./lib/admin-views');
 
@@ -165,6 +166,7 @@ async function handleHome(req, res) {
   const mobile = isMobileRequest(req);
   const file = await store.current();
 
+  const dict = t(lang);
   log(`${clientIp(req) || 'unknown'} · ${country || '??'} · ${lang} · ${mobile ? 'mobile' : 'desktop'} · /`);
 
   sendHtml(res, 200, renderHome({
@@ -172,6 +174,7 @@ async function handleHome(req, res) {
     device: mobile ? 'mobile' : 'desktop',
     zipName: file.name,
     zipSize: file.size,
+    messages: settings.messageFor(lang, dict),
   }));
 }
 
@@ -244,20 +247,20 @@ async function handleLoginPost(req, res) {
     return;
   }
 
-  const email = auth.normalizeEmail(form.email);
+  const email = String(form.email || '').trim();
   const password = String(form.password || '');
 
   if (!email || !password) {
-    sendHtml(res, 400, views.loginPage({ email, error: 'Vui lòng nhập đầy đủ email và mật khẩu.' }));
+    sendHtml(res, 400, views.loginPage({ email, error: 'Vui lòng nhập tên đăng nhập và mật khẩu.' }));
     return;
   }
 
-  if (email !== auth.normalizeEmail(auth.accountEmail())) {
+  if (!auth.matchesIdentity(email)) {
     auth.recordLoginFail(ip);
-    log(`Đăng nhập sai email: ${email} từ ${ip}`);
+    log(`Đăng nhập sai tài khoản: ${email} từ ${ip}`);
     sendHtml(res, 401, views.loginPage({
       email,
-      error: 'Email hoặc mật khẩu không đúng.',
+      error: 'Tài khoản hoặc mật khẩu không đúng.',
     }));
     return;
   }
@@ -267,7 +270,7 @@ async function handleLoginPost(req, res) {
     log(`Đăng nhập sai mật khẩu từ ${ip}`);
     sendHtml(res, 401, views.loginPage({
       email,
-      error: 'Email hoặc mật khẩu không đúng.',
+      error: 'Tài khoản hoặc mật khẩu không đúng.',
     }));
     return;
   }
@@ -532,12 +535,57 @@ async function handleDashboard(req, res) {
   }
 
   const file = await store.current();
+  const messages = settings.get();
+  const query = new URL(req.url, 'http://localhost').searchParams;
+  const msgFlag = query.get('msg');
   sendHtml(res, 200, views.dashboardPage({
     file,
     email: session.email,
     maxUploadMb: MAX_UPLOAD_MB,
     mailConfigured: mailer.isConfigured(),
+    messages,
+    languages: settings.languageList(),
+    customCount: settings.customCount(),
+    defaults: settings.DEFAULT_MESSAGES,
+    notice: msgFlag === 'ok' ? 'Đã lưu thông báo mới.' : msgFlag === 'err' ? 'Không lưu được thông báo.' : '',
+    noticeKind: msgFlag === 'err' ? 'err' : 'ok',
   }));
+}
+
+// Lưu thông báo hiển thị cho người truy cập
+async function handleSaveMessages(req, res) {
+  const session = currentSession(req);
+  if (!session) {
+    redirect(res, '/admin');
+    return;
+  }
+
+  let form = {};
+  try {
+    form = await readForm(req);
+  } catch {
+    redirect(res, '/admin/dashboard?msg=err');
+    return;
+  }
+
+  // Ô nhập của từng ngôn ngữ có tên dạng: msg[vi][desktopText]
+  const languages = {};
+  for (const [key, value] of Object.entries(form)) {
+    const m = /^lang\[([^\]]+)\]\[(desktopText|mobileText)\]$/.exec(key);
+    if (!m) continue;
+    const code = m[1];
+    languages[code] = languages[code] || {};
+    languages[code][m[2]] = value;
+  }
+
+  await settings.save({
+    desktopText: form.desktopText,
+    mobileText: form.mobileText,
+    languages,
+  });
+
+  log(`Cập nhật thông báo từ ${clientIp(req)}`);
+  redirect(res, '/admin/dashboard?msg=ok');
 }
 
 async function handleUpload(req, res) {
@@ -764,6 +812,11 @@ async function route(req, res) {
       return;
     }
 
+    if (pathname === '/admin/messages' && method === 'POST') {
+      await handleSaveMessages(req, res);
+      return;
+    }
+
     if (pathname === '/admin/email' && method === 'POST') {
       await handleAccountEmail(req, res);
       return;
@@ -789,6 +842,7 @@ async function route(req, res) {
 async function main() {
   await store.init();
   await store.ensureDefault();
+  await settings.init();
 
   // Render free dùng ổ đĩa tạm: tự tải lại file phát hành nếu có RESTORE_ZIP_URL
   const restored = await restore.restoreIfEmpty(store);

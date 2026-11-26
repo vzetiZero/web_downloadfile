@@ -330,6 +330,85 @@ body {
   .dropzone { padding: 32px 16px 26px; }
 }
 
+/* Danh sách ngôn ngữ trong panel thông báo */
+.msg-section {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: #6b7280;
+  margin: 22px 0 10px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.msg-section:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+
+.lang-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 8px;
+}
+
+.lang-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fcfdff;
+  overflow: hidden;
+}
+.lang-item[open] { grid-column: 1 / -1; background: #fff; }
+.lang-item.has-custom { border-color: #a9c8f5; background: #f7fbff; }
+
+.lang-item > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13.5px;
+  user-select: none;
+}
+.lang-item > summary::-webkit-details-marker { display: none; }
+.lang-item > summary::after {
+  content: "▾";
+  margin-left: auto;
+  color: #9aa3af;
+  font-size: 11px;
+  transition: transform .15s ease;
+}
+.lang-item[open] > summary::after { transform: rotate(180deg); }
+.lang-item > summary:hover { background: #f3f7ff; }
+
+.lang-name { font-weight: 600; color: #111827; }
+.lang-code {
+  font-size: 11px;
+  color: #6b7280;
+  background: #eef2f7;
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+.lang-flag {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: #9aa3af;
+  font-weight: 600;
+}
+.lang-item.has-custom .lang-flag { color: #1677ff; }
+
+.lang-fields { padding: 4px 11px 12px; }
+.lang-fields .form-label { font-size: 12px; margin-bottom: 4px; }
+.ph-hint {
+  display: block;
+  font-weight: 400;
+  color: #9aa3af;
+  font-size: 11.5px;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Bảng responsive: màn hình hẹp chuyển thành dạng card */
 @media (max-width: 860px) {
   .table thead { display: none; }

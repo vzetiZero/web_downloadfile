@@ -63,8 +63,8 @@ if not exist ".env" (
     echo # Cong chay web
     echo PORT=3000
     echo.
-    echo # Mat khau admin ban dau ^(doi duoc trong trang Quen mat khau^)
-    echo ADMIN_PASSWORD=Admin@123456
+    echo # Tai khoan dang nhap mac dinh: admin / 123456
+    echo ADMIN_PASSWORD=123456
     echo.
     echo # Email nhan ma OTP khi quen mat khau
     echo ADMIN_EMAIL=tmviet98@gmail.com
@@ -115,7 +115,7 @@ echo     1. Mo file .env, dien SMTP_PASS ^(App Password Gmail^)
 echo     2. Chay start.bat de khoi dong web
 echo     3. Vao http://localhost:3000/admin de dang nhap
 echo.
-echo   Mat khau admin mac dinh: Admin@123456
+echo   Tai khoan admin: admin / 123456
 echo   Email quan tri:          tmviet98@gmail.com
 echo.
 echo ============================================================
