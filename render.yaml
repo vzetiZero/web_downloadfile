@@ -30,6 +30,12 @@ services:
         sync: false
       - key: RESTORE_ZIP_URL
         sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: MESSAGES_GIST_ID
+        sync: false
+      - key: RESTORE_MESSAGES_URL
+        sync: false
       - key: RESEND_API_KEY
         sync: false
       - key: RESEND_FROM

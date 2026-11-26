@@ -398,7 +398,41 @@ body {
 
 .lang-fields { padding: 4px 11px 12px; }
 .lang-fields .form-label { font-size: 12px; margin-bottom: 4px; }
-.ph-hint {
+
+/* Thanh trạng thái đồng bộ câu thông báo */
+.sync-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12.8px;
+  line-height: 1.55;
+  padding: 10px 13px;
+  border-radius: 10px;
+  border: 1px solid #d7e6fb;
+  background: #f4f9ff;
+  color: #1e4b8f;
+  margin-bottom: 18px;
+}
+.sync-strip.warn {
+  border-color: #fde6b8;
+  background: #fffbf0;
+  color: #8a5a08;
+}
+.sync-strip code {
+  background: rgba(0, 0, 0, .06);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 12px;
+}
+.sync-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 6px;
+  background: #1677ff;
+}
+.sync-strip.warn .sync-dot { background: #e0a012; }.ph-hint {
   display: block;
   font-weight: 400;
   color: #9aa3af;

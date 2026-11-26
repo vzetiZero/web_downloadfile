@@ -19,6 +19,7 @@ const auth = require('./lib/auth');
 const mailer = require('./lib/mailer');
 const store = require('./lib/store');
 const settings = require('./lib/settings');
+const persist = require('./lib/persist');
 const restore = require('./lib/restore');
 const views = require('./lib/admin-views');
 
@@ -538,6 +539,13 @@ async function handleDashboard(req, res) {
   const messages = settings.get();
   const query = new URL(req.url, 'http://localhost').searchParams;
   const msgFlag = query.get('msg');
+  const noticeText = msgFlag === 'ok'
+    ? 'Đã lưu thông báo mới.'
+    : msgFlag === 'saved'
+      ? 'Đã lưu thông báo, nhưng chưa đồng bộ được lên nơi lưu bền (kiểm tra GITHUB_TOKEN).'
+      : msgFlag === 'err'
+        ? 'Không lưu được thông báo.'
+        : '';
   sendHtml(res, 200, views.dashboardPage({
     file,
     email: session.email,
@@ -547,8 +555,13 @@ async function handleDashboard(req, res) {
     languages: settings.languageList(),
     customCount: settings.customCount(),
     defaults: settings.DEFAULT_MESSAGES,
-    notice: msgFlag === 'ok' ? 'Đã lưu thông báo mới.' : msgFlag === 'err' ? 'Không lưu được thông báo.' : '',
-    noticeKind: msgFlag === 'err' ? 'err' : 'ok',
+    syncState: {
+      enabled: persist.isConfigured(),
+      canPush: persist.canPush(),
+      mode: persist.canPush() ? 'gist' : persist.isConfigured() ? 'url' : 'off',
+    },
+    notice: noticeText,
+    noticeKind: msgFlag === 'err' || msgFlag === 'saved' ? 'err' : 'ok',
   }));
 }
 
@@ -578,14 +591,23 @@ async function handleSaveMessages(req, res) {
     languages[code][m[2]] = value;
   }
 
-  await settings.save({
+  const saved = await settings.save({
     desktopText: form.desktopText,
     mobileText: form.mobileText,
     languages,
   });
 
   log(`Cập nhật thông báo từ ${clientIp(req)}`);
-  redirect(res, '/admin/dashboard?msg=ok');
+
+  // Đẩy lên nơi lưu bền để không mất khi Render khởi động lại
+  const sync = await persist.push(saved);
+  if (sync.pushed) {
+    log(`Đã đồng bộ thông báo lên gist ${sync.gistId}`);
+  } else if (sync.reason && sync.reason !== 'disabled' && sync.reason !== 'read_only') {
+    log(`Chưa đồng bộ được thông báo: ${sync.reason}`);
+  }
+
+  redirect(res, `/admin/dashboard?msg=${sync.pushed || sync.reason === 'disabled' || sync.reason === 'read_only' ? 'ok' : 'saved'}`);
 }
 
 async function handleUpload(req, res) {
@@ -850,6 +872,14 @@ async function main() {
     log(`Đã tự khôi phục file phát hành từ RESTORE_ZIP_URL (${store.humanSize(restored.size)})`);
   } else if (restored.reason && restored.reason !== 'disabled') {
     log(`Không khôi phục file tự động: ${restored.reason}`);
+  }
+
+  // Câu thông báo admin đã nhập cũng nằm trên ổ tạm → kéo lại từ gist/URL
+  const synced = await persist.restoreInto(settings);
+  if (synced.pulled) {
+    log(`Đã khôi phục thông báo đã lưu (${synced.languages} ngôn ngữ riêng${synced.shared ? ' + câu dùng chung' : ''})`);
+  } else if (synced.reason && synced.reason !== 'disabled' && synced.reason !== 'nothing_saved') {
+    log(`Không khôi phục thông báo: ${synced.reason}`);
   }
 
   const info = await auth.init({});
