@@ -1,0 +1,19 @@
+# ===== Bảo mật: KHÔNG đẩy file này lên GitHub =====
+.env
+.env.local
+.env.*.local
+
+# Dữ liệu chạy thật (mật khẩu đã hash, file ZIP khách tải, mã OTP)
+data/
+
+# Log và file tạm
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Thư mục cài đặt
+node_modules/
+
+# Ghi đè cấu hình của host
+render.yaml.local

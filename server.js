@@ -1,0 +1,827 @@
+'use strict';
+
+// Nạp .env trước khi đọc cấu hình
+require('./lib/env').loadEnv();
+
+// Web tải file ZIP tự động + trang quản trị (đăng nhập, quên mật khẩu OTP, upload).
+// Chạy: node server.js  hoặc  start.bat
+
+const http = require('http');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
+
+const { detectCountry, acceptLanguage, clientIp } = require('./lib/geo');
+const { normalizeLang, langForCountry } = require('./lib/i18n');
+const { renderHome } = require('./lib/pages');
+const auth = require('./lib/auth');
+const mailer = require('./lib/mailer');
+const store = require('./lib/store');
+const restore = require('./lib/restore');
+const views = require('./lib/admin-views');
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 500;
+const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+function log(...args) {
+  console.log(`[${new Date().toLocaleTimeString('vi-VN')}]`, ...args);
+}
+
+// ---------------------------------------------------------------------------
+// Tiện ích HTTP
+// ---------------------------------------------------------------------------
+
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, {
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'SAMEORIGIN',
+    ...headers,
+  });
+  res.end(body);
+}
+
+function sendHtml(res, status, html) {
+  send(res, status, html, { 'Content-Type': 'text/html; charset=utf-8' });
+}
+
+function sendJson(res, status, obj) {
+  send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8' });
+}
+
+function redirect(res, location, cookie) {
+  const headers = { Location: location, 'Cache-Control': 'no-store' };
+  if (cookie) headers['Set-Cookie'] = cookie;
+  res.writeHead(303, headers);
+  res.end();
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of String(raw).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    let value = part.slice(idx + 1).trim();
+    try { value = decodeURIComponent(value); } catch {}
+    out[key] = value;
+  }
+  return out;
+}
+
+function currentSession(req) {
+  const cookies = parseCookies(req);
+  return auth.validSession(cookies[auth.SESSION_COOKIE]);
+}
+
+function requireAdmin(req, res) {
+  const session = currentSession(req);
+  if (!session) {
+    sendJson(res, 401, { ok: false, error: 'Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại.' });
+    return null;
+  }
+  return session;
+}
+
+function readBody(req, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('Body quá lớn'), { code: 'TOO_LARGE' }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function readForm(req) {
+  const body = await readBody(req, 512 * 1024);
+  const params = new URLSearchParams(body.toString('utf8'));
+  const out = {};
+  for (const [key, value] of params) out[key] = value;
+  return out;
+}
+
+async function readJsonBody(req) {
+  try {
+    const body = await readBody(req, 64 * 1024);
+    return JSON.parse(body.toString('utf8') || '{}');
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Nhận diện thiết bị + ngôn ngữ
+// ---------------------------------------------------------------------------
+
+const MOBILE_UA = /Android|webOS|iPhone|iPod|iPad|BlackBerry|IEMobile|Opera Mini|Windows Phone|Silk|Kindle|PlayBook|Mobile|Tablet|Mobi/i;
+
+function isMobileRequest(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  if (!ua) return false;
+  if (/iPad|Tablet/i.test(ua)) return true;
+  return MOBILE_UA.test(ua);
+}
+
+const langCache = new Map();
+
+async function resolveLang(req, country) {
+  if (!country) {
+    for (const tag of acceptLanguage(req)) {
+      const lang = normalizeLang(tag);
+      if (lang) return lang;
+    }
+    return 'en';
+  }
+  if (langCache.has(country)) return langCache.get(country);
+  const lang = langForCountry(country, 'en');
+  if (langCache.size > 3000) langCache.clear();
+  langCache.set(country, lang);
+  return lang;
+}
+
+// ---------------------------------------------------------------------------
+// Trang chủ + tải file
+// ---------------------------------------------------------------------------
+
+async function handleHome(req, res) {
+  const country = await detectCountry(req);
+  const lang = await resolveLang(req, country);
+  const mobile = isMobileRequest(req);
+  const file = await store.current();
+
+  log(`${clientIp(req) || 'unknown'} · ${country || '??'} · ${lang} · ${mobile ? 'mobile' : 'desktop'} · /`);
+
+  sendHtml(res, 200, renderHome({
+    lang,
+    device: mobile ? 'mobile' : 'desktop',
+    zipName: file.name,
+    zipSize: file.size,
+  }));
+}
+
+async function handleDownload(req, res) {
+  const file = await store.current();
+  if (!file.size || !file.id) {
+    send(res, 404, 'Chưa có file nào được tải lên.');
+    return;
+  }
+
+  const source = path.join(store.FILE_DIR, `${file.id}.zip`);
+  let size = 0;
+  try {
+    size = (await fsp.stat(source)).size;
+  } catch {
+    send(res, 404, 'File không còn trên máy chủ.');
+    return;
+  }
+
+  const asciiFallback = 'file.zip';
+  const encoded = encodeURIComponent(file.name);
+
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Length': String(size),
+    'Content-Disposition': `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`,
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+    'X-Content-Type-Options': 'nosniff',
+  });
+
+  const stream = fs.createReadStream(source);
+  stream.on('error', (err) => {
+    log('Lỗi đọc file:', err.message);
+    res.destroy();
+  });
+  stream.on('end', () => { store.bumpDownload().catch(() => {}); });
+  stream.pipe(res);
+}
+
+// ---------------------------------------------------------------------------
+// Đăng nhập / đăng xuất
+// ---------------------------------------------------------------------------
+
+async function handleLoginPage(req, res) {
+  if (currentSession(req)) {
+    redirect(res, '/admin/dashboard');
+    return;
+  }
+  sendHtml(res, 200, views.loginPage({}));
+}
+
+async function handleLoginPost(req, res) {
+  const ip = clientIp(req) || 'unknown';
+  const locked = auth.loginLocked(ip);
+  if (locked) {
+    sendHtml(res, 429, views.loginPage({
+      error: `Bạn đã nhập sai quá nhiều lần. Vui lòng thử lại sau ${locked} phút.`,
+      lockedMinutes: locked,
+    }));
+    return;
+  }
+
+  let form = {};
+  try {
+    form = await readForm(req);
+  } catch {
+    sendHtml(res, 400, views.loginPage({ error: 'Yêu cầu không hợp lệ.' }));
+    return;
+  }
+
+  const email = auth.normalizeEmail(form.email);
+  const password = String(form.password || '');
+
+  if (!email || !password) {
+    sendHtml(res, 400, views.loginPage({ email, error: 'Vui lòng nhập đầy đủ email và mật khẩu.' }));
+    return;
+  }
+
+  if (email !== auth.normalizeEmail(auth.accountEmail())) {
+    auth.recordLoginFail(ip);
+    log(`Đăng nhập sai email: ${email} từ ${ip}`);
+    sendHtml(res, 401, views.loginPage({
+      email,
+      error: 'Email hoặc mật khẩu không đúng.',
+    }));
+    return;
+  }
+
+  if (!auth.verifyPassword(password)) {
+    auth.recordLoginFail(ip);
+    log(`Đăng nhập sai mật khẩu từ ${ip}`);
+    sendHtml(res, 401, views.loginPage({
+      email,
+      error: 'Email hoặc mật khẩu không đúng.',
+    }));
+    return;
+  }
+
+  auth.clearLoginFails(ip);
+  const token = auth.createSession(email);
+  log(`Đăng nhập thành công: ${email} từ ${ip}`);
+  redirect(res, '/admin/dashboard', auth.sessionCookie(token));
+}
+
+async function handleLogout(req, res) {
+  const cookies = parseCookies(req);
+  auth.destroySession(cookies[auth.SESSION_COOKIE]);
+  redirect(res, '/admin', auth.clearCookie());
+}
+
+// ---------------------------------------------------------------------------
+// Quên mật khẩu: gửi OTP
+// ---------------------------------------------------------------------------
+
+function maskEmail(email) {
+  const [user, domain] = String(email).split('@');
+  if (!domain) return email;
+  const visible = user.slice(0, Math.min(2, user.length));
+  return `${visible}${'*'.repeat(Math.max(1, user.length - visible.length))}@${domain}`;
+}
+
+async function handleForgotPage(req, res) {
+  sendHtml(res, 200, views.forgotPage({}));
+}
+
+async function handleForgotPost(req, res) {
+  const ip = clientIp(req) || 'unknown';
+  let form = {};
+  try {
+    form = await readForm(req);
+  } catch {
+    sendHtml(res, 400, views.forgotPage({ error: 'Yêu cầu không hợp lệ.' }));
+    return;
+  }
+
+  const email = auth.normalizeEmail(form.email);
+  if (!email) {
+    sendHtml(res, 400, views.forgotPage({ error: 'Vui lòng nhập email quản trị.' }));
+    return;
+  }
+
+  // Không tiết lộ email có đúng hay không
+  if (email !== auth.normalizeEmail(auth.accountEmail())) {
+    log(`Yêu cầu OTP cho email không khớp: ${email} từ ${ip}`);
+    sendHtml(res, 200, views.forgotPage({
+      email,
+      notice: 'Nếu email này là email quản trị, mã xác minh đã được gửi. Hãy kiểm tra hộp thư.',
+    }));
+    return;
+  }
+
+  const gate = auth.canRequestOtp(email);
+  if (!gate.ok) {
+    sendHtml(res, 429, views.forgotPage({
+      email,
+      error: gate.hourly
+        ? 'Bạn đã yêu cầu quá nhiều mã. Vui lòng thử lại sau ít phút.'
+        : `Vui lòng chờ ${gate.wait} giây trước khi yêu cầu mã mới.`,
+      cooldown: gate.wait,
+    }));
+    return;
+  }
+
+  const code = auth.issueOtp(email);
+  const baseUrl = publicBaseUrl(req);
+  const template = mailer.otpEmailTemplate({
+    code,
+    email,
+    minutes: Math.round(auth.OTP_TTL / 60000),
+    ip,
+    requestedAt: new Date().toLocaleString('vi-VN'),
+    resetUrl: `${baseUrl}/admin/reset?email=${encodeURIComponent(email)}&code=${code}`,
+  });
+
+  const result = await mailer.sendMail({
+    to: email,
+    subject: template.subject,
+    text: template.text,
+    html: template.html,
+  });
+
+  if (!result.ok && result.reason === 'not_configured') {
+    await auth.saveOtpPreview(email, code);
+    log(`Chưa cấu hình SMTP. Mã OTP đã ghi ra data/last-otp.txt`);
+    redirect(res, `/admin/reset?email=${encodeURIComponent(email)}&sent=preview`);
+    return;
+  }
+
+  if (!result.ok) {
+    log('Gửi email OTP thất bại:', result.error || result.reason);
+    await auth.saveOtpPreview(email, code);
+    sendHtml(res, 502, views.forgotPage({
+      email,
+      error: 'Không gửi được email. Kiểm tra cấu hình SMTP hoặc thử lại sau.',
+    }));
+    return;
+  }
+
+  log(`Đã gửi mã OTP tới ${maskEmail(email)} (yêu cầu từ ${ip})`);
+  redirect(res, `/admin/reset?email=${encodeURIComponent(email)}&sent=1`);
+}
+
+// Địa chỉ công khai của web (ưu tiên header của proxy/hosting)
+function publicBaseUrl(req) {
+  if (process.env.PUBLIC_URL) return String(process.env.PUBLIC_URL).replace(/\/+$/, '');
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
+    || (req.socket && req.socket.encrypted ? 'https' : 'http');
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`).split(',')[0].trim();
+  return `${proto}://${host}`;
+}
+
+async function handleResendOtp(req, res) {
+  const body = await readJsonBody(req);
+  const email = auth.normalizeEmail(body.email || auth.accountEmail());
+  const ip = clientIp(req) || 'unknown';
+
+  if (email !== auth.normalizeEmail(auth.accountEmail())) {
+    sendJson(res, 200, { ok: true, wait: 60 });
+    return;
+  }
+
+  const gate = auth.canRequestOtp(email);
+  if (!gate.ok) {
+    sendJson(res, 429, { ok: false, wait: gate.wait, error: `Vui lòng chờ ${gate.wait} giây.` });
+    return;
+  }
+
+  const code = auth.issueOtp(email);
+  const baseUrl = publicBaseUrl(req);
+  const template = mailer.otpEmailTemplate({
+    code,
+    email,
+    minutes: Math.round(auth.OTP_TTL / 60000),
+    ip,
+    requestedAt: new Date().toLocaleString('vi-VN'),
+    resetUrl: `${baseUrl}/admin/reset?email=${encodeURIComponent(email)}&code=${code}`,
+  });
+
+  const result = await mailer.sendMail({
+    to: email,
+    subject: template.subject,
+    text: template.text,
+    html: template.html,
+  });
+
+  if (!result.ok) {
+    await auth.saveOtpPreview(email, code);
+    sendJson(res, result.reason === 'not_configured' ? 200 : 502, {
+      ok: result.reason === 'not_configured',
+      wait: Math.round(auth.OTP_RESEND_COOLDOWN / 1000),
+      error: result.reason === 'not_configured'
+        ? 'Chưa cấu hình SMTP, mã được ghi ra data/last-otp.txt'
+        : 'Không gửi được email.',
+    });
+    return;
+  }
+
+  sendJson(res, 200, { ok: true, wait: Math.round(auth.OTP_RESEND_COOLDOWN / 1000) });
+}
+
+// ---------------------------------------------------------------------------
+// Đặt lại mật khẩu
+// ---------------------------------------------------------------------------
+
+async function handleResetPage(req, res, url) {
+  const email = auth.normalizeEmail(url.searchParams.get('email') || auth.accountEmail());
+  const sent = url.searchParams.get('sent');
+  const prefill = String(url.searchParams.get('code') || '').replace(/\D/g, '').slice(0, 6);
+  const notice = sent === 'preview'
+    ? 'Chưa cấu hình SMTP. Mã xác minh đã được ghi ra file data/last-otp.txt trên máy chủ.'
+    : sent
+      ? 'Mã xác minh đã được gửi tới email quản trị.'
+      : '';
+
+  sendHtml(res, 200, views.resetPage({
+    email,
+    maskedEmail: maskEmail(email),
+    notice,
+    prefill,
+    cooldown: sent ? Math.round(auth.OTP_RESEND_COOLDOWN / 1000) : 0,
+  }));
+}
+
+async function handleResetPost(req, res) {
+  const ip = clientIp(req) || 'unknown';
+  let form = {};
+  try {
+    form = await readForm(req);
+  } catch {
+    sendHtml(res, 400, views.resetPage({ error: 'Yêu cầu không hợp lệ.' }));
+    return;
+  }
+
+  const email = auth.normalizeEmail(form.email || auth.accountEmail());
+  const otp = String(form.otp || '').replace(/\D/g, '');
+  const password = String(form.password || '');
+  const confirm = String(form.confirm || '');
+
+  const render = (error, status = 400) => sendHtml(res, status, views.resetPage({
+    email,
+    maskedEmail: maskEmail(email),
+    error,
+  }));
+
+  if (email !== auth.normalizeEmail(auth.accountEmail())) {
+    render('Email không khớp với tài khoản quản trị.');
+    return;
+  }
+  if (otp.length !== 6) {
+    render('Mã xác minh phải gồm 6 chữ số.');
+    return;
+  }
+  if (password.length < 8) {
+    render('Mật khẩu mới phải có ít nhất 8 ký tự.');
+    return;
+  }
+  if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+    render('Mật khẩu mới phải có cả chữ và số.');
+    return;
+  }
+  if (password !== confirm) {
+    render('Mật khẩu nhập lại không khớp.');
+    return;
+  }
+
+  const check = auth.verifyOtp(email, otp);
+  if (!check.ok) {
+    render(check.error, 401);
+    return;
+  }
+
+  auth.consumeOtp(email);
+  await auth.changePassword(password);
+  await auth.clearOtpPreview();
+  auth.clearLoginFails(ip);
+
+  log(`Đặt lại mật khẩu thành công cho ${email} từ ${ip}`);
+
+  const token = auth.createSession(email);
+  redirect(res, '/admin/dashboard?reset=1', auth.sessionCookie(token));
+}
+
+// ---------------------------------------------------------------------------
+// Bảng điều khiển
+// ---------------------------------------------------------------------------
+
+async function handleDashboard(req, res) {
+  const session = currentSession(req);
+  if (!session) {
+    redirect(res, '/admin');
+    return;
+  }
+
+  const file = await store.current();
+  sendHtml(res, 200, views.dashboardPage({
+    file,
+    email: session.email,
+    maxUploadMb: MAX_UPLOAD_MB,
+    mailConfigured: mailer.isConfigured(),
+  }));
+}
+
+async function handleUpload(req, res) {
+  if (!requireAdmin(req, res)) return;
+
+  if (req.headers['x-admin-upload'] !== '1') {
+    sendJson(res, 400, { ok: false, error: 'Thiếu header tải lên.' });
+    return;
+  }
+
+  const declared = Number(req.headers['content-length']) || 0;
+  if (declared && declared > MAX_UPLOAD) {
+    sendJson(res, 413, { ok: false, error: `File quá lớn. Tối đa ${MAX_UPLOAD_MB} MB.` });
+    return;
+  }
+
+  const rawName = handleUploadName(req);
+  const tempPath = path.join(store.TEMP_DIR, `up-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.zip`);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(tempPath);
+      let written = 0;
+      let tooLarge = false;
+
+      req.on('data', (chunk) => {
+        written += chunk.length;
+        if (written > MAX_UPLOAD) {
+          tooLarge = true;
+          req.destroy();
+          out.destroy();
+        }
+      });
+      req.on('aborted', () => reject(new Error('Client huỷ tải lên')));
+      req.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', () => {
+        if (tooLarge) reject(Object.assign(new Error('too large'), { code: 'TOO_LARGE' }));
+        else resolve();
+      });
+      req.pipe(out);
+    });
+
+    const size = (await fsp.stat(tempPath)).size;
+    if (!size) throw Object.assign(new Error('File rỗng'), { code: 'EMPTY' });
+
+    const saved = await store.replace({
+      tempPath,
+      originalName: rawName,
+      size,
+    });
+
+    log(`Đã thay file: ${saved.name} (${saved.humanSize}) từ ${clientIp(req)}`);
+    sendJson(res, 200, { ok: true, name: saved.name, size: saved.size, humanSize: saved.humanSize });
+  } catch (err) {
+    await fsp.unlink(tempPath).catch(() => {});
+    if (err.code === 'TOO_LARGE') {
+      sendJson(res, 413, { ok: false, error: `File quá lớn. Tối đa ${MAX_UPLOAD_MB} MB.` });
+      return;
+    }
+    if (err.code === 'EMPTY') {
+      sendJson(res, 400, { ok: false, error: 'File rỗng, vui lòng chọn file khác.' });
+      return;
+    }
+    if (err.code === 'NOT_ZIP') {
+      sendJson(res, 400, { ok: false, error: err.message });
+      return;
+    }
+    log('Lỗi upload:', err.message);
+    sendJson(res, 500, { ok: false, error: 'Không lưu được file. Vui lòng thử lại.' });
+  }
+}
+
+function handleUploadName(req) {
+  const raw = req.headers['x-file-name'];
+  if (typeof raw !== 'string' || !raw) return 'file.zip';
+  let name = raw;
+  try { name = decodeURIComponent(raw); } catch {}
+  return store.sanitizeName(name);
+}
+
+async function handleDelete(req, res) {
+  if (!requireAdmin(req, res)) return;
+  try {
+    await store.remove();
+    log(`Đã xoá file hiện tại (${clientIp(req)})`);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    sendJson(res, 500, { ok: false, error: 'Không xoá được file.' });
+  }
+}
+
+async function handleAccountEmail(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const body = await readJsonBody(req);
+  const email = auth.normalizeEmail(body.email);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(email)) {
+    sendJson(res, 400, { ok: false, error: 'Email không hợp lệ.' });
+    return;
+  }
+  await auth.setEmail(email);
+  sendJson(res, 200, { ok: true, email });
+}
+
+// ---------------------------------------------------------------------------
+// File tĩnh
+// ---------------------------------------------------------------------------
+
+const MIME = {
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+};
+
+async function serveStatic(req, res, pathname) {
+  const rel = pathname.replace(/^\/+/, '');
+  const target = path.join(PUBLIC_DIR, rel);
+  if (!target.startsWith(PUBLIC_DIR)) {
+    send(res, 403, 'Forbidden');
+    return;
+  }
+  try {
+    const data = await fsp.readFile(target);
+    const ext = path.extname(target).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Content-Length': String(data.length),
+      'Cache-Control': 'public, max-age=86400',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(data);
+  } catch {
+    send(res, 404, 'Not found');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Định tuyến
+// ---------------------------------------------------------------------------
+
+async function route(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname.replace(/\/+$/, '') || '/';
+  const method = req.method || 'GET';
+
+  try {
+    if (pathname.startsWith('/vendor/') || pathname === '/admin.css') {
+      await serveStatic(req, res, pathname);
+      return;
+    }
+
+    if (pathname === '/favicon.ico') { send(res, 204, ''); return; }
+
+    if (pathname === '/robots.txt') {
+      send(res, 200, 'User-agent: *\nDisallow: /admin\n', { 'Content-Type': 'text/plain; charset=utf-8' });
+      return;
+    }
+
+    if (pathname === '/' && (method === 'GET' || method === 'HEAD')) {
+      await handleHome(req, res);
+      return;
+    }
+
+    if (pathname === '/download' && (method === 'GET' || method === 'HEAD')) {
+      await handleDownload(req, res);
+      return;
+    }
+
+    if (pathname === '/admin') {
+      if (method === 'GET') { await handleLoginPage(req, res); return; }
+      if (method === 'POST') { await handleLoginPost(req, res); return; }
+    }
+
+    if (pathname === '/admin/login' && method === 'POST') {
+      await handleLoginPost(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/logout' && method === 'POST') {
+      await handleLogout(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/forgot' && method === 'GET') {
+      await handleForgotPage(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/forgot' && method === 'POST') {
+      await handleForgotPost(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/reset' && method === 'GET') {
+      await handleResetPage(req, res, url);
+      return;
+    }
+
+    if (pathname === '/admin/reset' && method === 'POST') {
+      await handleResetPost(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/resend-otp' && method === 'POST') {
+      await handleResendOtp(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/dashboard' && method === 'GET') {
+      await handleDashboard(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/upload' && method === 'POST') {
+      await handleUpload(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/delete' && method === 'POST') {
+      await handleDelete(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/email' && method === 'POST') {
+      await handleAccountEmail(req, res);
+      return;
+    }
+
+    if (pathname.startsWith('/admin')) {
+      sendHtml(res, 404, '<!doctype html><meta charset="utf-8"><title>404</title><body style="font-family:system-ui;background:#f5f7fa;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><h1>404</h1><p style="color:#6b7280">Không tìm thấy trang. <a href="/admin">Về đăng nhập</a></p></div></body>');
+      return;
+    }
+
+    sendHtml(res, 404, '<!doctype html><meta charset="utf-8"><title>404</title><body style="font-family:system-ui;background:#08090d;color:#f2f3f7;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="font-size:26px">404</h1><p style="color:#9aa1b2">Trang không tồn tại. <a href="/" style="color:#6c8cff">Về trang chính</a></p></div></body>');
+  } catch (err) {
+    log('Lỗi xử lý', pathname, err && err.stack ? err.stack : err);
+    if (!res.headersSent) sendJson(res, 500, { ok: false, error: 'Lỗi máy chủ.' });
+    else res.destroy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Khởi động
+// ---------------------------------------------------------------------------
+
+async function main() {
+  await store.init();
+  await store.ensureDefault();
+
+  // Render free dùng ổ đĩa tạm: tự tải lại file phát hành nếu có RESTORE_ZIP_URL
+  const restored = await restore.restoreIfEmpty(store);
+  if (restored.restored) {
+    log(`Đã tự khôi phục file phát hành từ RESTORE_ZIP_URL (${store.humanSize(restored.size)})`);
+  } else if (restored.reason && restored.reason !== 'disabled') {
+    log(`Không khôi phục file tự động: ${restored.reason}`);
+  }
+
+  const info = await auth.init({});
+
+  const server = http.createServer((req, res) => { route(req, res); });
+
+  server.on('clientError', (err, socket) => {
+    if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  });
+
+  server.listen(PORT, HOST, () => {
+    console.log('');
+    console.log(`  Web tải file:   http://localhost:${PORT}`);
+    console.log(`  Trang quản trị: http://localhost:${PORT}/admin`);
+    console.log(`  Email quản trị: ${info.email}`);
+    console.log(`  Upload tối đa:  ${MAX_UPLOAD_MB} MB`);
+    console.log(`  SMTP:           ${mailer.isConfigured() ? 'đã cấu hình' : 'chưa cấu hình (OTP ghi ra data/last-otp.txt)'}`);
+    console.log('');
+  });
+
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      log('Đang dừng server…');
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 2500).unref();
+    });
+  }
+}
+
+main().catch((err) => {
+  console.error('Không khởi động được:', err);
+  process.exit(1);
+});
