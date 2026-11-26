@@ -1,0 +1,30 @@
+name: Giữ web luôn thức
+
+# Render free sẽ "ngủ" sau 15 phút không có khách, lần mở đầu phải chờ ~50 giây.
+# Workflow này gọi vào web mỗi 10 phút để giữ nó luôn thức.
+#
+# Nếu sau này bạn đổi tên miền, chỉ cần sửa biến WEB_URL bên dưới.
+
+on:
+  schedule:
+    # 5 phút là mức tối thiểu GitHub cho phép. Render ngủ sau 15 phút,
+    # nên 5 phút vẫn an toàn kể cả khi GitHub chạy trễ vài phút.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gọi vào trang chủ
+        env:
+          WEB_URL: https://web-download-bkz7.onrender.com
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 --retry 2 --retry-delay 5 "$WEB_URL/")
+          echo "HTTP $code từ $WEB_URL"
+          # 200 là tốt. 502/503 vẫn tính là có traffic nên vẫn đánh thức được service.
+          if [ "$code" = "000" ]; then
+            echo "Không kết nối được."
+            exit 1
+          fi
