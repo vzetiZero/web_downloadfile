@@ -21,6 +21,7 @@ const store = require('./lib/store');
 const settings = require('./lib/settings');
 const persist = require('./lib/persist');
 const restore = require('./lib/restore');
+const release = require('./lib/release');
 const views = require('./lib/admin-views');
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -694,7 +695,21 @@ async function handleUpload(req, res) {
     });
 
     log(`Đã thay file: ${saved.name} (${saved.humanSize}) từ ${clientIp(req)}`);
+
+    // Đẩy lên GitHub Release để không mất khi Render khởi động lại.
+    // Chạy nền để trang admin phản hồi ngay.
     sendJson(res, 200, { ok: true, name: saved.name, size: saved.size, humanSize: saved.humanSize });
+    release.pushRelease({
+      filePath: store.storedFilePath(saved),
+      name: saved.name,
+      size: saved.size,
+      checksum: saved.checksum,
+      updatedAt: saved.updatedAt,
+    }).then((out) => {
+      if (!out.pushed && out.reason !== 'disabled') {
+        log(`Chưa đẩy file lên release: ${out.reason}`);
+      }
+    }).catch((err) => log('Lỗi đẩy release:', err && err.message));
   } catch (err) {
     await fsp.unlink(tempPath).catch(() => {});
     if (err.code === 'TOO_LARGE') {
@@ -727,6 +742,12 @@ async function handleDelete(req, res) {
   try {
     await store.remove();
     log(`Đã xoá file hiện tại (${clientIp(req)})`);
+    // Xoá luôn trên release để lần khôi phục sau không mang file cũ về.
+    release.clearRelease().then((out) => {
+      if (!out.cleared && out.reason !== 'disabled') {
+        log(`Chưa xoá được file trên release: ${out.reason}`);
+      }
+    }).catch((err) => log('Lỗi xoá release:', err && err.message));
     sendJson(res, 200, { ok: true });
   } catch (err) {
     sendJson(res, 500, { ok: false, error: 'Không xoá được file.' });
@@ -902,10 +923,12 @@ async function main() {
   await store.ensureDefault();
   await settings.init();
 
-  // Render free dùng ổ đĩa tạm: tự tải lại file phát hành nếu có RESTORE_ZIP_URL
+  // Render free dùng ổ đĩa tạm: tự tải lại file phát hành nếu có
+  // GITHUB_REPO+GITHUB_TOKEN (GitHub Release) hoặc RESTORE_ZIP_URL.
   const restored = await restore.restoreIfEmpty(store);
   if (restored.restored) {
-    log(`Đã tự khôi phục file phát hành từ RESTORE_ZIP_URL (${store.humanSize(restored.size)})`);
+    const src = restored.source === 'release' ? 'GitHub Release' : 'RESTORE_ZIP_URL';
+    log(`Đã tự khôi phục file phát hành từ ${src} (${store.humanSize(restored.size)})`);
   } else if (restored.reason && restored.reason !== 'disabled') {
     log(`Không khôi phục file tự động: ${restored.reason}`);
   }

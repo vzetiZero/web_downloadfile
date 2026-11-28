@@ -30,6 +30,10 @@ services:
         sync: false
       - key: RESTORE_ZIP_URL
         sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: GITHUB_RELEASE_TAG
+        value: published-file
       - key: GITHUB_TOKEN
         sync: false
       - key: MESSAGES_GIST_ID
