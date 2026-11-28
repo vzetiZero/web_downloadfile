@@ -14,7 +14,6 @@ const crypto = require('crypto');
 
 const { detectCountry, acceptLanguage, clientIp } = require('./lib/geo');
 const { normalizeLang, langForCountry, t } = require('./lib/i18n');
-const { resolveLanguages } = require('./lib/autotranslate');
 const { renderHome } = require('./lib/pages');
 const auth = require('./lib/auth');
 const mailer = require('./lib/mailer');
@@ -171,12 +170,16 @@ async function handleHome(req, res) {
   const dict = t(lang);
   log(`${clientIp(req) || 'unknown'} · ${country || '??'} · ${lang} · ${mobile ? 'mobile' : 'desktop'} · /`);
 
+  // Nếu ngôn ngữ này chưa có bản dịch (ví dụ lần đầu có khách từ nước đó),
+  // dịch ngay và lưu lại. Dịch lỗi thì trang vẫn dùng câu gốc.
+  const messages = await settings.messageForLang(lang, dict);
+
   sendHtml(res, 200, renderHome({
     lang,
     device: mobile ? 'mobile' : 'desktop',
     zipName: file.name,
     zipSize: file.size,
-    messages: settings.messageFor(lang, dict),
+    messages,
   }));
 }
 
@@ -541,7 +544,7 @@ async function handleDashboard(req, res) {
   const query = new URL(req.url, 'http://localhost').searchParams;
   const msgFlag = query.get('msg');
   const noticeText = msgFlag === 'ok'
-    ? 'Đã lưu thông báo mới.'
+    ? 'Đã lưu. Hệ thống đang tự dịch sang 54 ngôn ngữ ở chế độ nền, khách vào là thấy đúng ngôn ngữ của họ.'
     : msgFlag === 'saved'
       ? 'Đã lưu thông báo, nhưng chưa đồng bộ được lên nơi lưu bền (kiểm tra GITHUB_TOKEN).'
       : msgFlag === 'err'
@@ -554,7 +557,6 @@ async function handleDashboard(req, res) {
     mailConfigured: mailer.isConfigured(),
     messages,
     languages: settings.languageList(),
-    customCount: settings.customCount(),
     defaults: settings.DEFAULT_MESSAGES,
     syncState: {
       enabled: persist.isConfigured(),
@@ -582,44 +584,43 @@ async function handleSaveMessages(req, res) {
     return;
   }
 
-  // Ô nhập của từng ngôn ngữ có tên dạng: msg[vi][desktopText]
-  const languages = {};
-  for (const [key, value] of Object.entries(form)) {
-    const m = /^lang\[([^\]]+)\]\[(desktopText|mobileText)\]$/.exec(key);
-    if (!m) continue;
-    const code = m[1];
-    languages[code] = languages[code] || {};
-    languages[code][m[2]] = value;
+  // Form chỉ còn 2 ô: câu cho máy tính và câu cho điện thoại.
+  // Bản dịch từng ngôn ngữ do server tự sinh, không nhập tay.
+  const desktopText = form.desktopText;
+  const mobileText = form.mobileText;
+
+  // Câu đổi thì bản dịch cũ của ô đó không còn đúng -> xoá để dịch lại.
+  const before = settings.get();
+  const sq = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, settings.MAX_LEN);
+  const desktopChanged = before.desktopText !== sq(desktopText);
+  const mobileChanged = before.mobileText !== sq(mobileText);
+
+  const keep = {};
+  if (!desktopChanged || !mobileChanged) {
+    for (const [code, entry] of Object.entries(before.languages || {})) {
+      const next = {};
+      if (!desktopChanged && entry.desktopText) next.desktopText = entry.desktopText;
+      if (!mobileChanged && entry.mobileText) next.mobileText = entry.mobileText;
+      if (next.desktopText || next.mobileText) keep[code] = next;
+    }
   }
 
-  const shared = { desktopText: form.desktopText, mobileText: form.mobileText };
-  const resolved = await resolveLanguages({
-    prev: settings.get(),
-    form: languages,
-    shared,
-    codes: settings.languageList().map((l) => l.code),
-  });
-
-  const saved = await settings.save({
-    desktopText: form.desktopText,
-    mobileText: form.mobileText,
-    languages: resolved.languages,
-  });
+  await settings.save({ desktopText, mobileText, languages: keep });
 
   log(`Cập nhật thông báo từ ${clientIp(req)}`);
-  if (resolved.failed.length) {
-    log(`Tự dịch lỗi ở: ${resolved.failed.join(', ')}`);
-  }
 
-  // Đẩy lên nơi lưu bền để không mất khi Render khởi động lại
-  const sync = await persist.push(saved);
-  if (sync.pushed) {
-    log(`Đã đồng bộ thông báo lên gist ${sync.gistId}`);
-  } else if (sync.reason && sync.reason !== 'disabled' && sync.reason !== 'read_only') {
-    log(`Chưa đồng bộ được thông báo: ${sync.reason}`);
-  }
+  // Dịch nền cho mọi ngôn ngữ rồi đẩy lên nơi lưu bền; lỗi thì khách vào sẽ được dịch bù.
+  const codes = settings.languageList().map((l) => l.code);
+  settings.prefillAll(codes).then(async (pre) => {
+    if (pre.failed.length) log(`Tự dịch lỗi ${pre.failed.length} ngôn ngữ, sẽ dịch bù khi có khách`);
+    const sync = await persist.push(settings.get());
+    if (sync.pushed) log(`Đã đồng bộ thông báo lên gist ${sync.gistId}`);
+    else if (sync.reason && sync.reason !== 'disabled' && sync.reason !== 'read_only') {
+      log(`Chưa đồng bộ được thông báo: ${sync.reason}`);
+    }
+  }).catch((err) => log(`Lỗi dịch nền: ${err && err.message}`));
 
-  redirect(res, `/admin/dashboard?msg=${sync.pushed || sync.reason === 'disabled' || sync.reason === 'read_only' ? 'ok' : 'saved'}`);
+  redirect(res, '/admin/dashboard?msg=ok');
 }
 
 async function handleUpload(req, res) {
