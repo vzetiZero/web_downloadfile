@@ -165,6 +165,8 @@ async function handleHome(req, res) {
   const country = await detectCountry(req);
   const lang = await resolveLang(req, country);
   const mobile = isMobileRequest(req);
+  // File có thể đã mất sau khi server ngủ -> tự khôi phục trước khi phục vụ.
+  await restore.ensureFile(store);
   const file = await store.current();
 
   const dict = t(lang);
@@ -184,6 +186,8 @@ async function handleHome(req, res) {
 }
 
 async function handleDownload(req, res) {
+  // Khách bấm tải mà file đã mất -> tự khôi phục rồi mới trả file.
+  await restore.ensureFile(store);
   const file = await store.current();
   if (!file.size || !file.id) {
     send(res, 404, 'Chưa có file nào được tải lên.');
@@ -540,6 +544,15 @@ async function handleDashboard(req, res) {
     return;
   }
 
+  // Nếu file đã mất (Render free xoá ổ đĩa) thì tự tải lại từ RESTORE_ZIP_URL.
+  const restoreInfo = restore.status();
+  const before = await store.hasPublishedFile();
+  await restore.ensureFile(store);
+  const after = await store.hasPublishedFile();
+  if (!before && after) {
+    log('Đã tự khôi phục file phát hành khi admin mở trang quản trị');
+  }
+  const restoreState = { ...restore.status(), wasMissing: !before && !after };
   const file = await store.current();
   const messages = settings.get();
   const query = new URL(req.url, 'http://localhost').searchParams;
@@ -564,6 +577,7 @@ async function handleDashboard(req, res) {
       canPush: persist.canPush(),
       mode: persist.canPush() ? 'gist' : persist.isConfigured() ? 'url' : 'off',
     },
+    restoreState,
     notice: noticeText,
     noticeKind: msgFlag === 'err' || msgFlag === 'saved' ? 'err' : 'ok',
   }));
@@ -882,6 +896,9 @@ async function route(req, res) {
 
 async function main() {
   await store.init();
+  // Khi có URL khôi phục thì không tạo file ZIP mẫu, để file mẫu không
+  // "chiếm chỗ" khiến việc khôi phục bị bỏ qua.
+  store.setAllowDefault(!restore.isConfigured());
   await store.ensureDefault();
   await settings.init();
 
