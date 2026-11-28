@@ -162,13 +162,38 @@ async function resolveLang(req, country) {
 // Trang chủ + tải file
 // ---------------------------------------------------------------------------
 
+// Xác định file đang phát hành: bản trên GitHub Release hay bản cục bộ vừa upload.
+//
+// `useLocal` = true khi bản cục bộ MỚI HƠN bản trên release — tức admin vừa
+// upload và tiến trình đẩy lên GitHub chưa xong. Lúc đó phải phục vụ bản cục bộ,
+// nếu không khách sẽ nhận link của bản CŨ (tên file và nội dung đều sai).
+//
+// @returns {Promise<{remote:object|null, local:object|null, useLocal:boolean}>}
+async function publishedChoice() {
+  const remote = await restore.downloadTarget();
+  const meta = await store.readMeta();
+  const hasLocal = Boolean(meta && meta.id && meta.size) && await store.hasPublishedFile();
+  const useLocal = hasLocal && (!remote || (meta.updatedAt || 0) > (remote.updatedAt || 0));
+  return { remote: remote || null, local: hasLocal ? meta : null, useLocal };
+}
+
 async function handleHome(req, res) {
   const country = await detectCountry(req);
   const lang = await resolveLang(req, country);
   const mobile = isMobileRequest(req);
-  // File có thể đã mất sau khi server ngủ -> tự khôi phục trước khi phục vụ.
-  await restore.ensureFile(store);
-  const file = await store.current();
+
+  // Ưu tiên metadata trên GitHub Release: chỉ vài trăm byte, không tải file về
+  // ổ tạm của Render. Nếu file cục bộ mới hơn (vừa upload, đang đẩy dở) thì
+  // hiển thị file cục bộ để khách thấy đúng bản vừa đăng.
+  const choice = await publishedChoice();
+  const file = choice.useLocal
+    ? { name: choice.local.name, size: choice.local.size }
+    : choice.remote
+      ? { name: choice.remote.name, size: choice.remote.size }
+      : await (async () => {
+        await restore.ensureFile(store);
+        return store.current();
+      })();
 
   const dict = t(lang);
   log(`${clientIp(req) || 'unknown'} · ${country || '??'} · ${lang} · ${mobile ? 'mobile' : 'desktop'} · /`);
@@ -187,6 +212,30 @@ async function handleHome(req, res) {
 }
 
 async function handleDownload(req, res) {
+  // Đường nhanh: chuyển thẳng khách sang GitHub Release. File không đi qua
+  // Render nên không tốn băng thông của Render và tải nhanh hơn nhiều.
+  //
+  // Ngoại lệ: vừa upload xong mà bản trên release chưa đẩy xong (file cục bộ
+  // mới hơn) thì trả file cục bộ, tránh đưa khách link của bản CŨ.
+  const choice = await publishedChoice();
+
+  if (choice.remote && choice.remote.url && !choice.useLocal) {
+    const remote = choice.remote;
+    log(`Chuyển tải "${remote.name}" sang GitHub Release (${clientIp(req)})`);
+    // Đếm lượt tải chạy nền, không chặn phản hồi.
+    store.bumpDownload(remote.name).catch(() => {});
+    res.writeHead(302, {
+      Location: remote.url,
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end();
+    return;
+  }
+
+  // Dự phòng: chưa có release (hoặc repo riêng tư), hoặc bản cục bộ mới hơn
+  // bản trên release -> trả file từ máy chủ.
   // Khách bấm tải mà file đã mất -> tự khôi phục rồi mới trả file.
   await restore.ensureFile(store);
   const file = await store.current();
@@ -545,16 +594,50 @@ async function handleDashboard(req, res) {
     return;
   }
 
-  // Nếu file đã mất (Render free xoá ổ đĩa) thì tự tải lại từ RESTORE_ZIP_URL.
-  const restoreInfo = restore.status();
-  const before = await store.hasPublishedFile();
-  await restore.ensureFile(store);
-  const after = await store.hasPublishedFile();
-  if (!before && after) {
-    log('Đã tự khôi phục file phát hành khi admin mở trang quản trị');
+  // Ưu tiên metadata trên release: KHÔNG tải file về ổ tạm của Render.
+  // Nếu vừa upload mà bản đẩy lên chưa xong thì hiển thị bản cục bộ.
+  const choice = await publishedChoice();
+  let restoreState;
+  let file;
+
+  if (choice.remote && !choice.useLocal) {
+    const remote = choice.remote;
+    const stats = await store.readStats();
+    restoreState = {
+      ...restore.status(),
+      mode: 'redirect',
+      wasMissing: false,
+      published: { name: remote.name, size: remote.size, updatedAt: remote.updatedAt },
+      // Lần đẩy gần nhất hỏng thì phải nói rõ, kẻo admin tưởng file đã an toàn.
+      pushFailed: stats.push && !stats.push.ok ? stats.push : null,
+    };
+    file = {
+      id: 'release',
+      name: remote.name,
+      originalName: remote.name,
+      size: remote.size,
+      humanSize: store.humanSize(remote.size),
+      updatedAt: remote.updatedAt || Date.now(),
+      checksum: remote.checksum,
+      downloads: stats.downloads || 0,
+    };
+  } else {
+    const before = await store.hasPublishedFile();
+    await restore.ensureFile(store);
+    const after = await store.hasPublishedFile();
+    if (!before && after) {
+      log('Đã tự khôi phục file phát hành khi admin mở trang quản trị');
+    }
+    const stats = await store.readStats();
+    restoreState = {
+      ...restore.status(),
+      mode: 'proxy',
+      wasMissing: !before && !after,
+      pushFailed: stats.push && !stats.push.ok ? stats.push : null,
+    };
+    file = await store.current();
   }
-  const restoreState = { ...restore.status(), wasMissing: !before && !after };
-  const file = await store.current();
+
   const messages = settings.get();
   const query = new URL(req.url, 'http://localhost').searchParams;
   const msgFlag = query.get('msg');
@@ -706,10 +789,23 @@ async function handleUpload(req, res) {
       checksum: saved.checksum,
       updatedAt: saved.updatedAt,
     }).then((out) => {
-      if (!out.pushed && out.reason !== 'disabled') {
-        log(`Chưa đẩy file lên release: ${out.reason}`);
+      // Đẩy xong thì bỏ cache để lượt tải kế tiếp chuyển thẳng sang release.
+      restore.clearTargetCache();
+      if (out.pushed) {
+        store.recordPush({ ok: true, name: saved.name }).catch(() => {});
+        return;
       }
-    }).catch((err) => log('Lỗi đẩy release:', err && err.message));
+      if (out.reason !== 'disabled') {
+        // Không đẩy được nghĩa là file chỉ nằm trên ổ tạm: Render restart là mất.
+        // Ghi lại để trang quản trị cảnh báo admin ngay, không im lặng.
+        log(`Chưa đẩy file lên release: ${out.reason}`);
+        store.recordPush({ ok: false, name: saved.name, error: out.reason }).catch(() => {});
+      }
+    }).catch((err) => {
+      const reason = err && err.message ? err.message : String(err);
+      log('Lỗi đẩy release:', reason);
+      store.recordPush({ ok: false, name: saved.name, error: reason }).catch(() => {});
+    });
   } catch (err) {
     await fsp.unlink(tempPath).catch(() => {});
     if (err.code === 'TOO_LARGE') {
@@ -741,9 +837,11 @@ async function handleDelete(req, res) {
   if (!requireAdmin(req, res)) return;
   try {
     await store.remove();
+    restore.clearTargetCache();
     log(`Đã xoá file hiện tại (${clientIp(req)})`);
     // Xoá luôn trên release để lần khôi phục sau không mang file cũ về.
     release.clearRelease().then((out) => {
+      restore.clearTargetCache();
       if (!out.cleared && out.reason !== 'disabled') {
         log(`Chưa xoá được file trên release: ${out.reason}`);
       }
@@ -925,12 +1023,21 @@ async function main() {
 
   // Render free dùng ổ đĩa tạm: tự tải lại file phát hành nếu có
   // GITHUB_REPO+GITHUB_TOKEN (GitHub Release) hoặc RESTORE_ZIP_URL.
-  const restored = await restore.restoreIfEmpty(store);
-  if (restored.restored) {
-    const src = restored.source === 'release' ? 'GitHub Release' : 'RESTORE_ZIP_URL';
-    log(`Đã tự khôi phục file phát hành từ ${src} (${store.humanSize(restored.size)})`);
-  } else if (restored.reason && restored.reason !== 'disabled') {
-    log(`Không khôi phục file tự động: ${restored.reason}`);
+  //
+  // Chế độ chuyển hướng: nếu release đã có file thì KHÔNG tải về ổ tạm nữa.
+  // Khách bấm tải sẽ được chuyển thẳng sang GitHub -> tiết kiệm băng thông
+  // Render và khởi động nhanh (không chờ tải 100 MB).
+  const direct = await restore.downloadTarget();
+  if (direct) {
+    log(`Chế độ chuyển hướng: "${direct.name}" (${store.humanSize(direct.size)}) nằm trên GitHub Release`);
+  } else {
+    const restored = await restore.restoreIfEmpty(store);
+    if (restored.restored) {
+      const src = restored.source === 'release' ? 'GitHub Release' : 'RESTORE_ZIP_URL';
+      log(`Đã tự khôi phục file phát hành từ ${src} (${store.humanSize(restored.size)})`);
+    } else if (restored.reason && restored.reason !== 'disabled') {
+      log(`Không khôi phục file tự động: ${restored.reason}`);
+    }
   }
 
   // Câu thông báo admin đã nhập cũng nằm trên ổ tạm → kéo lại từ gist/URL
