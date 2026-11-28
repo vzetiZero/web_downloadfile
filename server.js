@@ -14,6 +14,7 @@ const crypto = require('crypto');
 
 const { detectCountry, acceptLanguage, clientIp } = require('./lib/geo');
 const { normalizeLang, langForCountry, t } = require('./lib/i18n');
+const { resolveLanguages } = require('./lib/autotranslate');
 const { renderHome } = require('./lib/pages');
 const auth = require('./lib/auth');
 const mailer = require('./lib/mailer');
@@ -591,13 +592,24 @@ async function handleSaveMessages(req, res) {
     languages[code][m[2]] = value;
   }
 
+  const shared = { desktopText: form.desktopText, mobileText: form.mobileText };
+  const resolved = await resolveLanguages({
+    prev: settings.get(),
+    form: languages,
+    shared,
+    codes: settings.languageList().map((l) => l.code),
+  });
+
   const saved = await settings.save({
     desktopText: form.desktopText,
     mobileText: form.mobileText,
-    languages,
+    languages: resolved.languages,
   });
 
   log(`Cập nhật thông báo từ ${clientIp(req)}`);
+  if (resolved.failed.length) {
+    log(`Tự dịch lỗi ở: ${resolved.failed.join(', ')}`);
+  }
 
   // Đẩy lên nơi lưu bền để không mất khi Render khởi động lại
   const sync = await persist.push(saved);
