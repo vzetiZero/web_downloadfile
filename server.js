@@ -190,7 +190,7 @@ async function handleDownload(req, res) {
     return;
   }
 
-  const source = path.join(store.FILE_DIR, `${file.id}.zip`);
+  const source = store.storedFilePath(file);
   let size = 0;
   try {
     size = (await fsp.stat(source)).size;
@@ -199,11 +199,12 @@ async function handleDownload(req, res) {
     return;
   }
 
-  const asciiFallback = 'file.zip';
+  const ext = store.extOf(file.name);
+  const asciiFallback = `file${ext || '.zip'}`;
   const encoded = encodeURIComponent(file.name);
 
   res.writeHead(200, {
-    'Content-Type': 'application/zip',
+    'Content-Type': store.contentTypeFor(file.name),
     'Content-Length': String(size),
     'Content-Disposition': `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`,
     'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
@@ -638,7 +639,7 @@ async function handleUpload(req, res) {
   }
 
   const rawName = handleUploadName(req);
-  const tempPath = path.join(store.TEMP_DIR, `up-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.zip`);
+  const tempPath = path.join(store.TEMP_DIR, `up-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.part`);
 
   try {
     await new Promise((resolve, reject) => {
@@ -664,6 +665,11 @@ async function handleUpload(req, res) {
       req.pipe(out);
     });
 
+    if (!store.isAllowed(rawName)) {
+      sendJson(res, 400, { ok: false, error: `Chỉ nhận file ${store.ALLOWED_LABEL}.` });
+      return;
+    }
+
     const size = (await fsp.stat(tempPath)).size;
     if (!size) throw Object.assign(new Error('File rỗng'), { code: 'EMPTY' });
 
@@ -685,7 +691,7 @@ async function handleUpload(req, res) {
       sendJson(res, 400, { ok: false, error: 'File rỗng, vui lòng chọn file khác.' });
       return;
     }
-    if (err.code === 'NOT_ZIP') {
+    if (err.code === 'BAD_FORMAT') {
       sendJson(res, 400, { ok: false, error: err.message });
       return;
     }
@@ -696,7 +702,7 @@ async function handleUpload(req, res) {
 
 function handleUploadName(req) {
   const raw = req.headers['x-file-name'];
-  if (typeof raw !== 'string' || !raw) return 'file.zip';
+  if (typeof raw !== 'string' || !raw) return store.DEFAULT_ZIP_NAME;
   let name = raw;
   try { name = decodeURIComponent(raw); } catch {}
   return store.sanitizeName(name);
